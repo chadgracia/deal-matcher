@@ -287,7 +287,7 @@ SYSTEM_PROMPT = (
     "valuations, availability, or company facts.\n"
     "- If a deal has catalyst text, you may quote or paraphrase it as 'recent "
     "developments'. No hype, no superlatives, no performance predictions.\n"
-    "- For live deals, include the link https://trades.graciagroup.com/deals/{id} "
+    "- For live deals, include the link https://trades.graciagroup.com/deal/{id} "
     "using that deal's actual id field. Only link deals that appear in the data.\n"
     "- Tracked companies with buyer/seller interest but no live deal may be "
     "mentioned as 'we also track X and see active buyer interest' — no counts "
