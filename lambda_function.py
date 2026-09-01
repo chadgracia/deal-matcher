@@ -15,7 +15,7 @@ logger.setLevel(logging.INFO)
 ADMIN_KEY = os.environ["ADMIN_KEY"]
 
 PIPELINE_BASE = "https://api.pipelinecrm.com/api/v3"
-PIPELINE_AUTH = "api_key=ZRMHN4uJotjRDcZa8hKi&app_key=571978be28bd3b5b515a2cc5db96b674"
+PIPELINE_AUTH = "api_key=" + os.environ["PIPELINE_API_KEY"] + "&app_key=" + os.environ["PIPELINE_APP_KEY"]
 
 BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-6"
 
