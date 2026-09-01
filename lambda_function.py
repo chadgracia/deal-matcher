@@ -86,9 +86,22 @@ __RESULT__
 </div>
 <script>
 function dmCopy() {
-  var el = document.getElementById("dm-output");
+  var el = document.getElementById("dm-email");
+  if (!el) el = document.getElementById("dm-output");
   if (!el) return;
-  navigator.clipboard.writeText(el.innerText);
+  var text = el.innerText;
+  var htmlBody = text.split("\n").map(function(line) {
+    return line.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1">$1</a>');
+  }).join("<br>");
+  try {
+    var item = new ClipboardItem({
+      "text/html": new Blob([htmlBody], {type: "text/html"}),
+      "text/plain": new Blob([text], {type: "text/plain"})
+    });
+    navigator.clipboard.write([item]);
+  } catch (e) {
+    navigator.clipboard.writeText(text);
+  }
 }
 </script>
 </body>
@@ -286,6 +299,14 @@ SYSTEM_PROMPT = (
     "- Email tone: professional, concise, factual, first person as Chad. No "
     "emojis, no exclamation marks. Sign off as 'Chad'. Do not include a "
     "subject line unless useful; if included, keep it plain.\n"
+    "- The email body must be plain text only: no markdown, no asterisks or "
+    "bold markers, no bullet symbols, no headers. Company names on their own "
+    "line followed by the paragraph about them is fine. Paragraphs separated "
+    "by blank lines.\n"
+    "- Never reference email opens, link clicks, or any other tracking data "
+    "in the email itself, even if such data appears in the provided context. "
+    "Tracking data may inform which deals you select, but the client must "
+    "never see that it exists.\n"
     "- The email must not read as a mass blast — reference the inquirer's "
     "specifics.\n\n"
     "OUTPUT FORMAT (plain text, exactly these two sections):\n"
@@ -385,10 +406,20 @@ def lambda_handler(event, context):
                           '<div class="dm-result">Matching call failed: '
                           + html.escape(str(e)) + "</div>")
 
-        result_html = (
-            '<div class="dm-result" id="dm-output">' + html.escape(output) + "</div>"
-            '<button class="dm-copy" type="button" onclick="dmCopy()">Copy output</button>'
-        )
+        marker = "=== EMAIL DRAFT ==="
+        if marker in output:
+            matches_part, email_part = output.split(marker, 1)
+            result_html = (
+                '<div class="dm-result" id="dm-output">' + html.escape(matches_part.strip()) + "</div>"
+                '<div class="dm-label" style="margin-top:24px;">Email draft</div>'
+                '<div class="dm-result" id="dm-email">' + html.escape(email_part.strip()) + "</div>"
+                '<button class="dm-copy" type="button" onclick="dmCopy()">Copy email</button>'
+            )
+        else:
+            result_html = (
+                '<div class="dm-result" id="dm-output">' + html.escape(output) + "</div>"
+                '<button class="dm-copy" type="button" onclick="dmCopy()">Copy output</button>'
+            )
         return render(inquiry, person_id, result_html)
 
     return respond(405, "Method not allowed")
