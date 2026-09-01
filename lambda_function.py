@@ -90,7 +90,7 @@ function dmCopy() {
   if (!el) el = document.getElementById("dm-output");
   if (!el) return;
   var text = el.innerText;
-  var htmlBody = text.split("\n").map(function(line) {
+  var htmlBody = text.split("\\n").map(function(line) {
     return line.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1">$1</a>');
   }).join("<br>");
   try {
@@ -98,7 +98,9 @@ function dmCopy() {
       "text/html": new Blob([htmlBody], {type: "text/html"}),
       "text/plain": new Blob([text], {type: "text/plain"})
     });
-    navigator.clipboard.write([item]);
+    navigator.clipboard.write([item]).catch(function() {
+      navigator.clipboard.writeText(text);
+    });
   } catch (e) {
     navigator.clipboard.writeText(text);
   }
