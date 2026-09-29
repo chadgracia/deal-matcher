@@ -143,6 +143,15 @@ def get_live_deals():
         if not isinstance(d, dict):
             continue
         slim = {k: v for k, v in d.items() if v not in (None, "", [])}
+        side = (d.get("type") or "").strip()
+        if side == "Sell Order":
+            slim["order_side"] = "SELL ORDER (seller has shares available)"
+        elif side == "Buy Order":
+            slim["order_side"] = "BUY ORDER (another buyer seeking shares; no shares available)"
+        else:
+            slim["order_side"] = "UNKNOWN SIDE (do not present as available)"
+        if "stage" in slim:
+            slim["crm_stage"] = slim.pop("stage")
         deals.append(slim)
     return deals
 
@@ -310,7 +319,23 @@ SYSTEM_PROMPT = (
     "Tracking data may inform which deals you select, but the client must "
     "never see that it exists.\n"
     "- The email must not read as a mass blast — reference the inquirer's "
-    "specifics.\n\n"
+    "specifics.\n"
+    "- Every live deal has an order_side field. It is authoritative; never "
+    "infer side from any other field.\n"
+    "- First decide whether the inquirer wants to BUY or SELL (or both) from "
+    "the inquiry and person context.\n"
+    "- Inquirer wants to BUY: only SELL ORDER deals are matches. A BUY ORDER on "
+    "the same company is competing demand, never supply: never call it a sell "
+    "order, never say shares are available, and do not link it in the email. "
+    "You may mention it in MATCHES as 'competing buy order (demand signal), "
+    "not a match'.\n"
+    "- Inquirer wants to SELL: only BUY ORDER deals are matches; SELL ORDER "
+    "deals on the same company are competing supply, not matches.\n"
+    "- UNKNOWN SIDE deals are never matches.\n"
+    "- crm_stage is an internal CRM pipeline stage, not a price status. Never "
+    "describe a deal as 'Firm' or a 'firm order' based on crm_stage.\n"
+    "- In MATCHES, every live-deal line must begin with its side exactly as "
+    "'Sell order' or 'Buy order'.\n\n"
     "OUTPUT FORMAT (plain text, exactly these two sections):\n"
     "=== MATCHES ===\n"
     "Bullet list: each match with company, live deal or tracked-only, and one "
