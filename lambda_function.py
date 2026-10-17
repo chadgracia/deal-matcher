@@ -10,6 +10,7 @@ import logging
 from urllib.parse import parse_qs
 
 import boto3
+from botocore.config import Config
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -303,7 +304,7 @@ def get_person_context(person_id):
                 continue
             if text.startswith("Daily Highlight "):
                 continue
-            notes.append({"created_at": n.get("created_at", ""), "note": text[:500]})
+            notes.append({"created_at": n.get("created_at", ""), "note": text[:2000]})
             if len(notes) >= 15:
                 break
         ctx["notes"] = notes
@@ -322,6 +323,7 @@ SYSTEM_PROMPT = (
     "the inquirer's stated interests (sector, deal size, structure, geography), "
     "and (2) draft a factual introduction email Chad can send.\n\n"
     "STRICT RULES:\n"
+    "- OUTPUT FORMAT IS MANDATORY: your response must begin with the line '=== MATCHES ===' and contain only the MATCHES section and the email draft (plus the near-misses the existing rules ask for). Do NOT write any preamble, step-by-step analysis, 'Step 1', 'Wait', 're-reading' or other visible reasoning before or between sections. Keep each match to one or two lines.\n"
     "- Use ONLY facts present in the data provided. Never invent pricing, "
     "valuations, availability, or company facts.\n"
     "- If a deal has catalyst text, you may quote or paraphrase it as 'recent "
@@ -397,15 +399,19 @@ def run_matcher(inquiry, person_ctx, deals, tracked):
         "live_deals": deals,
         "tracked_companies_no_live_deal": tracked,
     }
-    client = boto3.client("bedrock-runtime", region_name="us-east-1")
+    client = boto3.client("bedrock-runtime", region_name="us-east-1",
+                          config=Config(read_timeout=280, connect_timeout=10, retries={"max_attempts": 1}))
     resp = client.converse(
         modelId=BEDROCK_MODEL,
         system=[{"text": SYSTEM_PROMPT}],
         messages=[{"role": "user", "content": [{"text": json.dumps(user_content, default=str)}]}],
-        inferenceConfig={"maxTokens": 3000, "temperature": 0.2},
+        inferenceConfig={"maxTokens": 6000, "temperature": 0.2},
     )
     parts = resp.get("output", {}).get("message", {}).get("content", [])
-    return "\n".join(p.get("text", "") for p in parts if p.get("text"))
+    text = "\n".join(p.get("text", "") for p in parts if p.get("text"))
+    if resp.get("stopReason") == "max_tokens":
+        text += "\n\n[Output was cut off at the length limit — re-run, or narrow the inquiry.]"
+    return text
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
