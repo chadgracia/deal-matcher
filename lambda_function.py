@@ -82,6 +82,10 @@ PAGE = """<!DOCTYPE html>
 <textarea name="inquiry" required>__INQUIRY__</textarea>
 <label class="dm-label">Person ID (optional)</label>
 <input type="text" name="person_id" inputmode="numeric" value="__PID__">
+<label class="dm-label">Looking for</label>
+<label><input type="radio" name="side" value="both" __SIDE_BOTH__> Both</label>&nbsp;&nbsp;
+<label><input type="radio" name="side" value="sell" __SIDE_SELL__> Sell orders (shares available)</label>&nbsp;&nbsp;
+<label><input type="radio" name="side" value="buy" __SIDE_BUY__> Buy orders (buyers seeking shares)</label>
 <br>
 <button class="dm-btn" type="submit">Find matches &amp; draft email</button>
 </form>
@@ -121,8 +125,10 @@ def respond(status, body, content_type="text/html"):
     }
 
 
-def render(inquiry="", pid="", result_html=""):
+def render(inquiry="", pid="", result_html="", side="both"):
     page = PAGE.replace("__KEY__", ADMIN_KEY)
+    for val, token in (("both", "__SIDE_BOTH__"), ("sell", "__SIDE_SELL__"), ("buy", "__SIDE_BUY__")):
+        page = page.replace(token, "checked" if side == val else "")
     page = page.replace("__INQUIRY__", html.escape(inquiry))
     page = page.replace("__PID__", html.escape(pid))
     page = page.replace("__RESULT__", result_html)
@@ -137,6 +143,37 @@ def load_s3_json(bucket, key):
     return json.loads(obj["Body"].read())
 
 
+DEAL_KEEP_KEYWORDS = ("company", "name", "id", "type", "structure", "layer", "size",
+                      "price", "gross", "net", "valuation", "val", "industry", "class",
+                      "stage", "catalyst", "highlight", "updated", "series", "deadline",
+                      "fee", "carry", "seller_role", "exemption", "direct", "pps", "round")
+DEAL_DROP_KEYWORDS = ("people", "person", "contact", "email", "phone", "summary",
+                      "description", "custom_fields", "note", "user", "owner", "value_in_cents")
+DEAL_TEXT_CAP = 300
+
+
+def _slim_deal(d):
+    out = {}
+    for k, v in d.items():
+        if v in (None, "", [], {}):
+            continue
+        lk = str(k).lower()
+        if any(x in lk for x in DEAL_DROP_KEYWORDS):
+            continue
+        if lk == "value":   # Pipeline deal value = Chad's commission — never send
+            continue
+        if not any(x in lk for x in DEAL_KEEP_KEYWORDS):
+            continue
+        if isinstance(v, (dict, list)) and lk not in ("company",):
+            v = json.dumps(v, default=str)[:DEAL_TEXT_CAP]
+        if isinstance(v, str) and len(v) > DEAL_TEXT_CAP:
+            v = v[:DEAL_TEXT_CAP].rstrip() + "…"
+        out[k] = v
+    if isinstance(out.get("company"), dict):
+        out["company"] = out["company"].get("name") or json.dumps(out["company"], default=str)[:120]
+    return out
+
+
 def get_live_deals():
     data = load_s3_json("pipeline-public-deal-data", "pipeline_deals.json")
     if isinstance(data, dict):
@@ -145,7 +182,7 @@ def get_live_deals():
     for d in data:
         if not isinstance(d, dict):
             continue
-        slim = {k: v for k, v in d.items() if v not in (None, "", [])}
+        slim = _slim_deal(d)
         side = (d.get("type") or "").strip()
         if side == "Sell Order":
             slim["order_side"] = "SELL ORDER (seller has shares available)"
@@ -324,6 +361,7 @@ SYSTEM_PROMPT = (
     "and (2) draft a factual introduction email Chad can send.\n\n"
     "STRICT RULES:\n"
     "- OUTPUT FORMAT IS MANDATORY: your response must begin with the line '=== MATCHES ===' and contain only the MATCHES section and the email draft (plus the near-misses the existing rules ask for). Do NOT write any preamble, step-by-step analysis, 'Step 1', 'Wait', 're-reading' or other visible reasoning before or between sections. Keep each match to one or two lines.\n"
+    "- If deal_side_filter is 'sell' or 'buy', only that side of the book was provided; do not mention that the other side is missing.\n"
     "- Use ONLY facts present in the data provided. Never invent pricing, "
     "valuations, availability, or company facts.\n"
     "- If a deal has catalyst text, you may quote or paraphrase it as 'recent "
@@ -392,10 +430,11 @@ SYSTEM_PROMPT = (
 )
 
 
-def run_matcher(inquiry, person_ctx, deals, tracked):
+def run_matcher(inquiry, person_ctx, deals, tracked, side="both"):
     user_content = {
         "inquiry": inquiry,
         "person_context": person_ctx or "none provided",
+        "deal_side_filter": side,
         "live_deals": deals,
         "tracked_companies_no_live_deal": tracked,
     }
@@ -465,6 +504,27 @@ def lambda_handler(event, context):
             "body": json.dumps(out, indent=2, default=str),
         }
 
+    if params.get("view") == "deal_fields":
+        raw = load_s3_json("pipeline-public-deal-data", "pipeline_deals.json")
+        if isinstance(raw, dict):
+            raw = raw.get("deals") or []
+        raw = [d for d in raw if isinstance(d, dict)]
+        all_keys, kept_keys = {}, {}
+        for d in raw:
+            for k in d.keys():
+                all_keys[k] = all_keys.get(k, 0) + 1
+            for k in _slim_deal(d).keys():
+                kept_keys[k] = kept_keys.get(k, 0) + 1
+        before = len(json.dumps(raw, default=str))
+        after = len(json.dumps([_slim_deal(d) for d in raw], default=str))
+        out = {"deal_count": len(raw), "chars_before": before, "chars_after": after,
+               "kept_keys": kept_keys,
+               "dropped_keys": {k: n for k, n in all_keys.items() if k not in kept_keys},
+               "sample_slim_deal": _slim_deal(raw[0]) if raw else None}
+        return {"statusCode": 200,
+                "headers": {"Content-Type": "application/json", "X-Robots-Tag": "noindex, nofollow"},
+                "body": json.dumps(out, indent=2, default=str)}
+
     method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
 
     if method == "GET":
@@ -477,9 +537,12 @@ def lambda_handler(event, context):
         form = parse_qs(body)
         inquiry = form.get("inquiry", [""])[0].strip()
         person_id = form.get("person_id", [""])[0].strip()
+        side = form.get("side", ["both"])[0]
+        if side not in ("both", "sell", "buy"):
+            side = "both"
 
         if not inquiry:
-            return render(result_html='<div class="dm-result">No inquiry text received.</div>')
+            return render(result_html='<div class="dm-result">No inquiry text received.</div>', side=side)
 
         try:
             deals = get_live_deals()
@@ -487,7 +550,14 @@ def lambda_handler(event, context):
             logger.error(f"deals load failed: {e}")
             return render(inquiry, person_id,
                           '<div class="dm-result">Failed to load deals data: '
-                          + html.escape(str(e)) + "</div>")
+                          + html.escape(str(e)) + "</div>", side)
+
+        if side == "sell":
+            matched_deals = [d for d in deals if str(d.get("order_side", "")).startswith("SELL ORDER")]
+        elif side == "buy":
+            matched_deals = [d for d in deals if str(d.get("order_side", "")).startswith("BUY ORDER")]
+        else:
+            matched_deals = deals
 
         deal_companies = set()
         for d in deals:
@@ -505,6 +575,8 @@ def lambda_handler(event, context):
                 lname = item["company"].lower()
                 if lname in deal_companies:
                     continue
+                if not item["buy_count"] and not item["sell_count"]:
+                    continue
                 comp = companies.get(lname)
                 tracked.append({
                     "company": item["company"],
@@ -512,6 +584,8 @@ def lambda_handler(event, context):
                     "buy_interest_count": item["buy_count"],
                     "sell_interest_count": item["sell_count"],
                 })
+            tracked.sort(key=lambda t: (t["buy_interest_count"] or 0) + (t["sell_interest_count"] or 0), reverse=True)
+            tracked = tracked[:150]
         except Exception as e:
             logger.warning(f"tracked-company build failed: {e}")
 
@@ -520,12 +594,12 @@ def lambda_handler(event, context):
             person_ctx = get_person_context(person_id)
 
         try:
-            output = run_matcher(inquiry, person_ctx, deals, tracked)
+            output = run_matcher(inquiry, person_ctx, matched_deals, tracked, side)
         except Exception as e:
             logger.error(f"bedrock call failed: {e}")
             return render(inquiry, person_id,
                           '<div class="dm-result">Matching call failed: '
-                          + html.escape(str(e)) + "</div>")
+                          + html.escape(str(e)) + "</div>", side)
 
         marker = "=== EMAIL DRAFT ==="
         if marker in output:
@@ -541,6 +615,6 @@ def lambda_handler(event, context):
                 '<div class="dm-result" id="dm-output">' + html.escape(output) + "</div>"
                 '<button class="dm-copy" type="button" onclick="dmCopy()">Copy output</button>'
             )
-        return render(inquiry, person_id, result_html)
+        return render(inquiry, person_id, result_html, side)
 
     return respond(405, "Method not allowed")
