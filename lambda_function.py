@@ -162,6 +162,8 @@ def _slim_deal(d):
             continue
         if lk == "value":   # Pipeline deal value = Chad's commission — never send
             continue
+        if lk in ("name", "structure_class"):   # "name" is the counterparty contact's name — never send; structure_class duplicates structure
+            continue
         if not any(x in lk for x in DEAL_KEEP_KEYWORDS):
             continue
         if isinstance(v, (dict, list)) and lk not in ("company",):
