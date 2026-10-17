@@ -194,6 +194,8 @@ def get_live_deals():
             slim["order_side"] = "UNKNOWN SIDE (do not present as available)"
         if "stage" in slim:
             slim["crm_stage"] = slim.pop("stage")
+        # Internal only (own-deal exclusion); stripped before the model call.
+        slim["_contact_email"] = str(d.get("email") or "").strip().lower()
         deals.append(slim)
     return deals
 
@@ -293,6 +295,40 @@ def pipeline_get(path_and_query):
         return json.loads(r.read())
 
 
+def load_security_names():
+    """Reverse maps {option_id: company_name} for Holding (h), Buy Interest (b)
+    and Sell Interest (s), from agent-data.json's security_ids."""
+    h, b, s = {}, {}, {}
+    try:
+        data = load_s3_json("pipeline-token", "agent-data.json")
+        for name, ids in (data.get("security_ids") or {}).items():
+            if not isinstance(ids, dict):
+                continue
+            for key, out in (("h", h), ("b", b), ("s", s)):
+                try:
+                    if ids.get(key) is not None:
+                        out[int(ids[key])] = name
+                except (TypeError, ValueError):
+                    pass
+    except Exception as e:
+        logger.warning(f"security names load failed: {e}")
+        return {}, {}, {}
+    return h, b, s
+
+
+def _option_ids(v):
+    items = v if isinstance(v, list) else ([v] if v not in (None, "") else [])
+    out = []
+    for x in items:
+        if isinstance(x, dict):
+            x = x.get("id") or x.get("option_id") or x.get("value")
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 def get_person_context(person_id):
     ctx = {}
     try:
@@ -305,6 +341,27 @@ def get_person_context(person_id):
         if not slim:
             slim = {"raw": json.dumps(person)[:800]}
         ctx["person"] = slim
+        emails = []
+        for k, v in person.items():
+            if "email" in str(k).lower() and isinstance(v, str):
+                e = v.strip().lower()
+                if e and e not in emails:
+                    emails.append(e)
+        ctx["_emails"] = emails  # internal only; stripped before the model call
+        cf = person.get("custom_fields") or {}
+        h_names, b_names, s_names = load_security_names()
+        interests = {}
+        for label, field, names in (("wants_to_buy", "custom_label_3322093", b_names),
+                                    ("wants_to_sell", "custom_label_3759156", s_names),
+                                    ("holds", "custom_label_3740611", h_names)):
+            found = []
+            for oid in _option_ids(cf.get(field)):
+                name = names.get(oid)
+                if name and name not in found:
+                    found.append(name)
+            if found:
+                interests[label] = found
+        ctx["crm_interests"] = interests
     except Exception as e:
         logger.warning(f"person fetch failed for {person_id}: {e}")
 
@@ -363,6 +420,11 @@ SYSTEM_PROMPT = (
     "and (2) draft a factual introduction email Chad can send.\n\n"
     "STRICT RULES:\n"
     "- OUTPUT FORMAT IS MANDATORY: your response must begin with the line '=== MATCHES ===' and contain only the MATCHES section and the email draft (plus the near-misses the existing rules ask for). Do NOT write any preamble, step-by-step analysis, 'Step 1', 'Wait', 're-reading' or other visible reasoning before or between sections. Keep each match to one or two lines.\n"
+    "- PERSON INTERESTS: person_context.crm_interests is the authoritative record of what this person wants. wants_to_buy = companies to show them SELL ORDERS for. wants_to_sell and holds = companies they own; for those, only BUY ORDERS (buyers for their shares) are relevant. Never recommend a person buy a company listed in wants_to_sell or holds, and never treat a note saying they are glad they own something, or that it was a good investment, as interest in buying more. Only recommend buying more of a held company if a note explicitly says they want to add to it.\n"
+    "- Sector matches (from notes or the inquiry) are secondary to crm_interests and named companies. Prefer deals with a stated size and price over deals with neither.\n"
+    "- person_context.own_deals_excluded lists this person's own orders with Chad. Never present them as opportunities; you may reference them only to understand what the person is doing.\n"
+    "- The EMAIL may feature at most 6 companies, the strongest matches first. All other matches stay in the MATCHES list only.\n"
+    "- No markdown anywhere in the output: no **bold**, no headers, no bullet symbols in the email. Do not restate the task or write 'Re-reading' or any reasoning text — start directly with '=== MATCHES ==='.\n"
     "- If deal_side_filter is 'sell' or 'buy', only that side of the book was provided; do not mention that the other side is missing.\n"
     "- Use ONLY facts present in the data provided. Never invent pricing, "
     "valuations, availability, or company facts.\n"
@@ -594,6 +656,19 @@ def lambda_handler(event, context):
         person_ctx = None
         if person_id:
             person_ctx = get_person_context(person_id)
+
+        own_emails = set((person_ctx or {}).get("_emails") or [])
+        if own_emails:
+            own = [d for d in matched_deals if d.get("_contact_email") in own_emails]
+            matched_deals = [d for d in matched_deals if d.get("_contact_email") not in own_emails]
+            person_ctx["own_deals_excluded"] = [
+                {"company": d.get("company"), "order_side": d.get("order_side"), "id": d.get("id")}
+                for d in own
+            ]
+        for d in matched_deals:
+            d.pop("_contact_email", None)
+        if person_ctx:
+            person_ctx.pop("_emails", None)
 
         try:
             output = run_matcher(inquiry, person_ctx, matched_deals, tracked, side)
