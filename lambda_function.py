@@ -1,6 +1,8 @@
 import os
 import json
 import base64
+import datetime
+import re
 import html
 import urllib.request
 import urllib.parse
@@ -267,17 +269,43 @@ def get_person_context(person_id):
         logger.warning(f"person fetch failed for {person_id}: {e}")
 
     try:
-        notes_data = pipeline_get(f"/notes.json?person_id={person_id}")
-        entries = notes_data.get("entries") if isinstance(notes_data, dict) else notes_data
+        all_entries = []
+        for page in range(1, 6):  # max 5 pages x 200 = 1,000 notes, read-only GETs
+            notes_data = pipeline_get(f"/notes.json?person_id={person_id}&per_page=200&page={page}")
+            entries = notes_data.get("entries") if isinstance(notes_data, dict) else notes_data
+            entries = [n for n in (entries or []) if isinstance(n, dict)]
+            all_entries.extend(entries)
+            pages = (notes_data.get("pagination") or {}).get("pages", 1) if isinstance(notes_data, dict) else 1
+            if page >= (pages or 1):
+                break
+
+        def _note_ts(n):
+            raw = str(n.get("created_at") or "")
+            for fmt in ("%Y/%m/%d %H:%M:%S %z", "%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z"):
+                try:
+                    return datetime.datetime.strptime(raw, fmt).timestamp()
+                except ValueError:
+                    pass
+            return 0
+
+        click_markers = ("via weekly newsletter", "via news mailer", "(automated scan", "Daily Highlight ")
         notes = []
-        for n in (entries or [])[:15]:
-            if not isinstance(n, dict):
-                continue
+        for n in sorted(all_entries, key=_note_ts, reverse=True):
             text = n.get("content") or n.get("body") or n.get("note") or ""
             text = urllib.parse.unquote(str(text))
-            text = " ".join(html.unescape(text).replace("<br>", " ").split())
-            if text:
-                notes.append({"created_at": n.get("created_at", ""), "note": text[:500]})
+            text = html.unescape(text)
+            text = re.sub(r"<br\s*/?>|</p>", " ", text, flags=re.I)
+            text = re.sub(r"<[^>]+>", "", text)
+            text = " ".join(text.split())
+            if not text:
+                continue
+            if text.startswith(("Clicked ", "Requested info on ")) and any(m in text for m in click_markers):
+                continue
+            if text.startswith("Daily Highlight "):
+                continue
+            notes.append({"created_at": n.get("created_at", ""), "note": text[:500]})
+            if len(notes) >= 15:
+                break
         ctx["notes"] = notes
     except Exception as e:
         logger.warning(f"notes fetch failed for {person_id}: {e}")
