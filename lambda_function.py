@@ -387,6 +387,50 @@ def lambda_handler(event, context):
     if params.get("key") != ADMIN_KEY:
         return respond(403, "Forbidden")
 
+    if params.get("view") == "notes_debug":
+        pid = (params.get("pid") or "").strip()
+        out = {"pid": pid, "variants": {}}
+        if not pid.isdigit():
+            out["error"] = "pid must be a numeric Pipeline person ID"
+        else:
+            variants = {
+                "current_plain_person_id": f"/notes.json?person_id={pid}&per_page=50",
+                "conditions_person_id": f"/notes.json?conditions[person_id]={pid}&per_page=50",
+            }
+            for label, path in variants.items():
+                v = {"request_path": path}
+                try:
+                    data = pipeline_get(path)
+                    entries = data.get("entries") if isinstance(data, dict) else data
+                    entries = entries or []
+                    v["pagination"] = data.get("pagination") if isinstance(data, dict) else None
+                    v["returned"] = len(entries)
+                    v["matching_this_person"] = sum(1 for n in entries if isinstance(n, dict) and str(n.get("person_id")) == pid)
+                    v["sample"] = [
+                        {
+                            "id": n.get("id"),
+                            "person_id": n.get("person_id"),
+                            "deal_id": n.get("deal_id"),
+                            "company_id": n.get("company_id"),
+                            "created_at": n.get("created_at"),
+                            "content_start": " ".join(html.unescape(urllib.parse.unquote(str(n.get("content") or ""))).replace("<br>", " ").split())[:120],
+                        }
+                        for n in entries[:8] if isinstance(n, dict)
+                    ]
+                except Exception as e:
+                    v["error"] = f"{type(e).__name__}: {e}"
+                    if hasattr(e, "read"):
+                        try:
+                            v["error_body"] = e.read().decode("utf-8", "replace")[:500]
+                        except Exception:
+                            pass
+                out["variants"][label] = v
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json", "X-Robots-Tag": "noindex, nofollow"},
+            "body": json.dumps(out, indent=2, default=str),
+        }
+
     method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
 
     if method == "GET":
