@@ -82,10 +82,10 @@ PAGE = """<!DOCTYPE html>
 <textarea name="inquiry" required>__INQUIRY__</textarea>
 <label class="dm-label">Person ID (optional)</label>
 <input type="text" name="person_id" inputmode="numeric" value="__PID__">
-<label class="dm-label">Looking for</label>
-<label><input type="radio" name="side" value="both" __SIDE_BOTH__> Both</label>&nbsp;&nbsp;
-<label><input type="radio" name="side" value="sell" __SIDE_SELL__> Sell orders (shares available)</label>&nbsp;&nbsp;
-<label><input type="radio" name="side" value="buy" __SIDE_BUY__> Buy orders (buyers seeking shares)</label>
+<label class="dm-label">The inquirer is</label>
+<label><input type="radio" name="side" value="both" __SIDE_BOTH__> Not sure (search everything)</label>&nbsp;&nbsp;
+<label><input type="radio" name="side" value="sell" __SIDE_SELL__> A buyer (show sell orders)</label>&nbsp;&nbsp;
+<label><input type="radio" name="side" value="buy" __SIDE_BUY__> A seller (show buy orders)</label>
 <br>
 <button class="dm-btn" type="submit">Find matches &amp; draft email</button>
 </form>
