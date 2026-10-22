@@ -517,6 +517,219 @@ def run_matcher(inquiry, person_ctx, deals, tracked, side="both"):
     return text
 
 
+# ── Deal-ID check (post-processing of the model's text) ───────────────────────
+# The model copies ids from live_deals and sometimes takes a neighbor's. Each
+# link/"id N" is checked against the company the text names next to it.
+
+DEAL_LINK_RE = re.compile(r"https://trades\.graciagroup\.com/deal/(\d+)")
+DEAL_ID_REF_RE = re.compile(r"\bid\b[\s:#]*(\d{4,})", re.IGNORECASE)
+_MONEY_RE = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)\s*([KkMmBb])?\b|\b(\d[\d,]*(?:\.\d+)?)\s*([KkMmBb])\b")
+_NUM_RE = re.compile(r"\$?\s?(\d[\d,]*(?:\.\d+)?)\s*([KkMmBb])?\b")
+_SUFFIX_MULT = {"k": 1e3, "m": 1e6, "b": 1e9}
+_DEAL_NUM_KEYWORDS = ("size", "price", "gross", "net", "pps", "min", "max")
+_COMPANY_SUFFIXES = {"inc", "corp", "corporation", "llc", "ltd", "co", "company", "holdings",
+                     "technologies", "technology", "industries", "labs"}
+ID_CHECK_FLAG = " [CHECK DEAL ID]"
+
+
+def _to_number(digits, suffix):
+    try:
+        n = float(digits.replace(",", ""))
+    except ValueError:
+        return None
+    return n * _SUFFIX_MULT.get((suffix or "").lower(), 1)
+
+
+def _text_numbers(text):
+    """Dollar figures in the model's text ("$1.5M", "$137", "1.5M"); bare
+    numbers (ids, years) are ignored."""
+    text = DEAL_LINK_RE.sub(" ", text)
+    out = set()
+    for m in _MONEY_RE.finditer(text):
+        n = _to_number(m.group(1) or m.group(3), m.group(2) or m.group(4))
+        if n:
+            out.add(n)
+    return out
+
+
+def _deal_numbers(deal):
+    out = set()
+    for k, v in deal.items():
+        lk = str(k).lower()
+        if lk == "id" or not any(x in lk for x in _DEAL_NUM_KEYWORDS):
+            continue
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            if v:
+                out.add(float(v))
+            continue
+        for m in _NUM_RE.finditer(str(v)):
+            n = _to_number(m.group(1), m.group(2))
+            if n:
+                out.add(n)
+    return out
+
+
+def _nums_match(a, b):
+    return abs(a - b) <= max(0.01, 0.005 * max(abs(a), abs(b)))
+
+
+def _deal_company(deal):
+    c = deal.get("company")
+    if isinstance(c, dict):
+        c = c.get("name")
+    return str(c or "").strip()
+
+
+def _deal_side(deal):
+    s = str(deal.get("order_side") or "")
+    return "sell" if s.startswith("SELL ORDER") else ("buy" if s.startswith("BUY ORDER") else None)
+
+
+def _company_aliases(name):
+    """The name plus the name without a trailing corporate suffix
+    ("Anduril Industries" -> "anduril")."""
+    low = name.lower().strip()
+    words = re.sub(r"[.,]", " ", low).split()
+    aliases = {low}
+    while words and words[-1] in _COMPANY_SUFFIXES:
+        words = words[:-1]
+        if words:
+            aliases.add(" ".join(words))
+    return {a for a in aliases if len(a) >= 3}
+
+
+def _company_mentions(text, alias_map):
+    """[(start, company_lower)] for every known company name in text, longest
+    alias first so "Moonshot AI" beats a shorter overlapping alias."""
+    hits, taken = [], []
+    for alias in sorted(alias_map, key=len, reverse=True):
+        for m in re.finditer(r"(?<![\w])" + re.escape(alias) + r"(?![\w])", text, re.IGNORECASE):
+            if any(m.start() < e and s < m.end() for s, e in taken):
+                continue
+            taken.append((m.start(), m.end()))
+            hits.append((m.start(), alias_map[alias]))
+    return sorted(hits)
+
+
+def _contains_company(text, company_lower, alias_map):
+    return any(c == company_lower for _, c in _company_mentions(text, alias_map))
+
+
+def check_deal_ids(output, deals):
+    """Verify every deal link / "id N" against the company named beside it.
+    Returns (fixed_output, corrections, unresolved): corrections are
+    (company, old_id, new_id); unresolved are (company, id, candidate_ids,
+    reason). Wrong ids are replaced when exactly one live deal for the named
+    company (same side) fits -- by the size/price figures in that
+    line/paragraph, or because it is the only one; otherwise the reference
+    is kept and flagged with ID_CHECK_FLAG."""
+    by_id = {str(d.get("id")): d for d in deals if d.get("id") is not None}
+    names = {}
+    for d in deals:
+        n = _deal_company(d)
+        if n:
+            names[n.lower()] = n
+    alias_map = {}
+    for low, n in names.items():
+        for a in _company_aliases(n):
+            alias_map.setdefault(a, low)
+
+    marker = "=== EMAIL DRAFT ==="
+    email_start = output.find(marker)
+    if email_start < 0:
+        email_start = len(output)
+
+    refs = [(m.start(1), m.end(1), m.group(1), "link") for m in DEAL_LINK_RE.finditer(output)]
+    refs += [(m.start(1), m.end(1), m.group(1), "ref") for m in DEAL_ID_REF_RE.finditer(output)]
+    refs.sort()
+
+    edits, corrections, unresolved = [], [], []
+    for start, end, old_id, kind in refs:
+        line_s = output.rfind("\n", 0, start) + 1
+        line_e = output.find("\n", end)
+        line_e = len(output) if line_e < 0 else line_e
+        line = output[line_s:line_e]
+        block_s = output.rfind("\n\n", 0, start)
+        block_s = 0 if block_s < 0 else block_s + 2
+        block_s = max(block_s, email_start + len(marker)) if start > email_start else block_s
+        block_e = output.find("\n\n", end)
+        block_e = len(output) if block_e < 0 else block_e
+        block = output[block_s:block_e]
+
+        in_email = start > email_start
+        if in_email:
+            # Email: nearest company name above the link in its paragraph
+            # (the company sits on its own line above the description).
+            before = _company_mentions(output[block_s:start], alias_map)
+            named = before[-1][1] if before else None
+            context = block
+        else:
+            # MATCHES: the company at the start of the line.
+            mentions = _company_mentions(line, alias_map)
+            named = mentions[0][1] if mentions else None
+            context = line
+
+        deal = by_id.get(old_id)
+        deal_co = _deal_company(deal).lower() if deal else None
+        if deal and (named is None or deal_co == named or _contains_company(line, deal_co, alias_map)):
+            continue
+        if named is None:
+            unresolved.append(("(company not identified)", old_id, [], "id not in the live deals sent"))
+            edits.append((end, end, ID_CHECK_FLAG))
+            continue
+
+        low_ctx = context.lower()
+        side = ("sell" if "sell order" in low_ctx else "buy" if "buy order" in low_ctx
+                else (_deal_side(deal) if deal else None))
+        company_deals = [d for d in deals if _deal_company(d).lower() == named]
+        cands = [d for d in company_deals if side is None or _deal_side(d) == side] or company_deals
+
+        chosen = None
+        if len(cands) == 1:
+            chosen = cands[0]
+        elif cands:
+            figures = _text_numbers(context)
+            scored = [(sum(1 for f in figures if any(_nums_match(f, n) for n in _deal_numbers(d))), d)
+                      for d in cands]
+            best = max(s for s, _ in scored)
+            top = [d for s, d in scored if s == best]
+            if best > 0 and len(top) == 1:
+                chosen = top[0]
+
+        company_label = names.get(named, named)
+        if chosen is not None:
+            new_id = str(chosen.get("id"))
+            if new_id != old_id:
+                edits.append((start, end, new_id))
+                if (company_label, old_id, new_id) not in corrections:
+                    corrections.append((company_label, old_id, new_id))
+            continue
+        reason = "id not in the live deals sent" if deal is None else f"id is a {_deal_company(deal)} deal"
+        unresolved.append((company_label, old_id, [str(d.get("id")) for d in cands], reason))
+        edits.append((end, end, ID_CHECK_FLAG))
+
+    for s, e, rep in sorted(edits, key=lambda x: (x[0], x[1]), reverse=True):
+        output = output[:s] + rep + output[e:]
+    return output, corrections, unresolved
+
+
+def id_warning_html(corrections, unresolved):
+    if not corrections and not unresolved:
+        return ""
+    items = [f"<li>{html.escape(c)}: {html.escape(o)} &rarr; {html.escape(n)} (corrected)</li>"
+             for c, o, n in corrections]
+    for c, i, cands, reason in unresolved:
+        cand_txt = ", ".join(cands) if cands else "none found"
+        items.append(f"<li>{html.escape(c)}: {html.escape(i)} NOT changed &mdash; {html.escape(reason)}; "
+                     f"candidates: {html.escape(cand_txt)}</li>")
+    return ('<div class="dm-idwarn" style="border:2px solid #b91c1c;background:#fef2f2;color:#7f1d1d;'
+            'padding:14px 18px;margin-top:30px;font-size:15px;line-height:1.5;">'
+            "<strong>Deal ID check &mdash; review before copying:</strong><ul style=\"margin:8px 0 0 18px;padding:0;\">"
+            + "".join(items) + "</ul></div>")
+
+
 # ── Handler ───────────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
@@ -678,6 +891,7 @@ def lambda_handler(event, context):
                           '<div class="dm-result">Matching call failed: '
                           + html.escape(str(e)) + "</div>", side)
 
+        output, id_fixes, id_flags = check_deal_ids(output, matched_deals)
         marker = "=== EMAIL DRAFT ==="
         if marker in output:
             matches_part, email_part = output.split(marker, 1)
@@ -692,6 +906,7 @@ def lambda_handler(event, context):
                 '<div class="dm-result" id="dm-output">' + html.escape(output) + "</div>"
                 '<button class="dm-copy" type="button" onclick="dmCopy()">Copy output</button>'
             )
+        result_html = id_warning_html(id_fixes, id_flags) + result_html
         return render(inquiry, person_id, result_html, side)
 
     return respond(405, "Method not allowed")
