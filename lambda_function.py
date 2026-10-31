@@ -359,7 +359,7 @@ def resolve_person_input(raw):
         return None, _person_note("Person field ignored &mdash; enter a numeric ID or an email.", amber=True)
     email = val.lower()
     try:
-        data = pipeline_get(f"/people.json?conditions[email]={urllib.parse.quote(email)}&per_page=10")
+        data = pipeline_get(f"/people.json?conditions[person_email]={urllib.parse.quote(email)}&per_page=10")
         entries = data.get("entries") if isinstance(data, dict) else data
         matches = [p for p in (entries or []) if isinstance(p, dict) and any(
             str(p.get(k) or "").strip().lower() == email for k in ("email", "email2", "home_email"))]
