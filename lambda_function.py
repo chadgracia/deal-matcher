@@ -483,8 +483,10 @@ SYSTEM_PROMPT = (
     "valuations, availability, or company facts.\n"
     "- If a deal has catalyst text, you may quote or paraphrase it as 'recent "
     "developments'. No hype, no superlatives, no performance predictions.\n"
-    "- For live deals, include the link https://trades.graciagroup.com/deal/{id} "
-    "using that deal's actual id field. Only link deals that appear in the data.\n"
+    "- For live deals, include a link. To link a live deal, write its ref in "
+    "double square brackets exactly as given, e.g. [[D7]]. Never write deal ids, "
+    "URLs for deals, or any other number as a deal reference. Only link deals "
+    "that appear in the data.\n"
     "- Tracked companies with buyer/seller interest but no live deal may be "
     "mentioned as 'we also track X and see active buyer interest' — no counts "
     "in the email itself unless they strengthen credibility (rounding is fine, "
@@ -729,7 +731,8 @@ def check_deal_ids(output, deals):
         if deal and (named is None or deal_co == named or _contains_company(line, deal_co, alias_map)):
             continue
         if named is None:
-            unresolved.append(("(company not identified)", old_id, [], "id not in the live deals sent"))
+            if not any(u[0] == "(company not identified)" and u[1] == old_id for u in unresolved):
+                unresolved.append(("(company not identified)", old_id, [], "id not in the live deals sent"))
             edits.append((end, end, ID_CHECK_FLAG))
             continue
 
@@ -760,7 +763,8 @@ def check_deal_ids(output, deals):
                     corrections.append((company_label, old_id, new_id))
             continue
         reason = "id not in the live deals sent" if deal is None else f"id is a {_deal_company(deal)} deal"
-        unresolved.append((company_label, old_id, [str(d.get("id")) for d in cands], reason))
+        if not any(u[0] == company_label and u[1] == old_id for u in unresolved):
+            unresolved.append((company_label, old_id, [str(d.get("id")) for d in cands], reason))
         edits.append((end, end, ID_CHECK_FLAG))
 
     for s, e, rep in sorted(edits, key=lambda x: (x[0], x[1]), reverse=True):
@@ -768,7 +772,35 @@ def check_deal_ids(output, deals):
     return output, corrections, unresolved
 
 
+DEAL_REF_RE = re.compile(r"\[\[\s*([Dd]\d+)\s*\]\]")
+
+
+def resolve_deal_refs(output, ref_map, deals):
+    """Replace [[Dn]] refs written by the model with real deal links.
+    Unknown refs become "[[Dn]] [CHECK DEAL ID]". Returns (output, unresolved)
+    with unresolved in check_deal_ids' (company, id, candidates, reason) shape."""
+    unresolved = []
+
+    def _sub(m):
+        ref = m.group(1).upper()
+        real = ref_map.get(ref)
+        if real:
+            return f"https://trades.graciagroup.com/deal/{real}"
+        if not any(u[1] == ref for u in unresolved):
+            unresolved.append(("(unknown ref)", ref, [], "ref not in the live deals sent"))
+        return f"[[{ref}]]" + ID_CHECK_FLAG
+
+    return DEAL_REF_RE.sub(_sub, output), unresolved
+
+
 def id_warning_html(corrections, unresolved):
+    corrections = list(dict.fromkeys(corrections))
+    seen, deduped = set(), []
+    for u in unresolved:
+        if (u[0], u[1]) not in seen:
+            seen.add((u[0], u[1]))
+            deduped.append(u)
+    unresolved = deduped
     if not corrections and not unresolved:
         return ""
     items = [f"<li>{html.escape(c)}: {html.escape(o)} &rarr; {html.escape(n)} (corrected)</li>"
@@ -937,15 +969,34 @@ def lambda_handler(event, context):
         if person_ctx:
             person_ctx.pop("_emails", None)
 
+        # Short refs (D1, D2, ...) stand in for real deal ids so the model
+        # never copies an 8-digit id; resolve_deal_refs maps them back.
+        ref_map, model_deals, id_to_ref = {}, [], {}
+        for i, d in enumerate(matched_deals, 1):
+            ref = f"D{i}"
+            if d.get("id") is not None:
+                ref_map[ref] = str(d["id"])
+                id_to_ref[str(d["id"])] = ref
+            md = {"ref": ref}
+            md.update({k: v for k, v in d.items() if k != "id"})
+            model_deals.append(md)
+        if person_ctx and person_ctx.get("own_deals_excluded"):
+            for od in person_ctx["own_deals_excluded"]:
+                ref = id_to_ref.get(str(od.pop("id", None)))
+                if ref:
+                    od["ref"] = ref
+
         try:
-            output = run_matcher(inquiry, person_ctx, matched_deals, tracked, side)
+            output = run_matcher(inquiry, person_ctx, model_deals, tracked, side)
         except Exception as e:
             logger.error(f"bedrock call failed: {e}")
             return render(inquiry, person_id,
                           person_note + '<div class="dm-result">Matching call failed: '
                           + html.escape(str(e)) + "</div>", side)
 
+        output, ref_flags = resolve_deal_refs(output, ref_map, matched_deals)
         output, id_fixes, id_flags = check_deal_ids(output, matched_deals)
+        id_flags = ref_flags + id_flags
         marker = "=== EMAIL DRAFT ==="
         if marker in output:
             matches_part, email_part = output.split(marker, 1)
