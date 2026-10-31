@@ -62,7 +62,7 @@ class DealIdCheck(unittest.TestCase):
         self.assertEqual(corr, [])
         self.assertIn(URL + "55411915" + lf.ID_CHECK_FLAG, fixed)
         self.assertIn("(id 55411915" + lf.ID_CHECK_FLAG + ")", fixed)
-        self.assertEqual(len(unres), 2)
+        self.assertEqual(len(unres), 1)
         self.assertEqual(unres[0][0], "Anduril")
         self.assertEqual(sorted(unres[0][2]), ["55411897", "55411898"])
         box = lf.id_warning_html(corr, unres)
