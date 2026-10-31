@@ -81,8 +81,8 @@ PAGE = """<!DOCTYPE html>
 <form method="POST" action="/?key=__KEY__">
 <label class="dm-label">Inquiry text</label>
 <textarea name="inquiry" required>__INQUIRY__</textarea>
-<label class="dm-label">Person ID (optional)</label>
-<input type="text" name="person_id" inputmode="numeric" value="__PID__">
+<label class="dm-label">Person ID or email (optional)</label>
+<input type="text" name="person_id" value="__PID__">
 <label class="dm-label">The inquirer is</label>
 <label><input type="radio" name="side" value="both" __SIDE_BOTH__> Not sure (search everything)</label>&nbsp;&nbsp;
 <label><input type="radio" name="side" value="sell" __SIDE_SELL__> A buyer (show sell orders)</label>&nbsp;&nbsp;
@@ -328,6 +328,58 @@ def _option_ids(v):
         except (TypeError, ValueError):
             pass
     return out
+
+
+def _pipeline_ts(raw):
+    raw = str(raw or "")
+    for fmt in ("%Y/%m/%d %H:%M:%S %z", "%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return datetime.datetime.strptime(raw, fmt).timestamp()
+        except ValueError:
+            pass
+    return 0
+
+
+def _person_note(text_html, amber=False):
+    style = ("border:1px solid #d97706;background:#fffbeb;color:#92400e;" if amber
+             else "border:1px solid #ddd;background:#f6f6f4;color:#333;")
+    return ('<div class="dm-person-note" style="' + style
+            + 'padding:10px 14px;margin-top:30px;font-size:14px;line-height:1.4;">' + text_html + "</div>")
+
+
+def resolve_person_input(raw):
+    """Person field -> (pipeline_person_id or None, note_html). Accepts a numeric
+    Pipeline ID or an email address (read-only Pipeline lookup)."""
+    val = (raw or "").strip()
+    if not val:
+        return None, ""
+    if val.isdigit():
+        return val, ""
+    if "@" not in val:
+        return None, _person_note("Person field ignored &mdash; enter a numeric ID or an email.", amber=True)
+    email = val.lower()
+    try:
+        data = pipeline_get(f"/people.json?conditions[email]={urllib.parse.quote(email)}&per_page=10")
+        entries = data.get("entries") if isinstance(data, dict) else data
+        matches = [p for p in (entries or []) if isinstance(p, dict) and any(
+            str(p.get(k) or "").strip().lower() == email for k in ("email", "email2", "home_email"))]
+        if not matches:
+            return None, _person_note(f"No Pipeline person found for {html.escape(email)} "
+                                      "&mdash; matched without CRM context.", amber=True)
+        matches.sort(key=lambda p: _pipeline_ts(p.get("updated_at")), reverse=True)
+        p = matches[0]
+        pid = str(p.get("id"))
+        name = (p.get("full_name") or " ".join(x for x in (p.get("first_name"), p.get("last_name")) if x)
+                or "(no name)").strip()
+        company = p.get("company_name") or "no company"
+        note = (f'Matched <a href="https://app.pipelinecrm.com/people/{html.escape(pid)}" target="_blank">'
+                f"{html.escape(name)}</a> ({html.escape(str(company))}), Pipeline ID {html.escape(pid)}")
+        if len(matches) > 1:
+            note += f" ({len(matches)} records share this email &mdash; used the most recently updated)"
+        return pid, _person_note(note)
+    except Exception as e:
+        logger.warning(f"person email lookup failed for {email}: {e}")
+        return None, _person_note("Email lookup failed &mdash; matched without CRM context.", amber=True)
 
 
 def get_person_context(person_id):
@@ -867,9 +919,10 @@ def lambda_handler(event, context):
         except Exception as e:
             logger.warning(f"tracked-company build failed: {e}")
 
+        resolved_pid, person_note = resolve_person_input(person_id)
         person_ctx = None
-        if person_id:
-            person_ctx = get_person_context(person_id)
+        if resolved_pid:
+            person_ctx = get_person_context(resolved_pid)
 
         own_emails = set((person_ctx or {}).get("_emails") or [])
         if own_emails:
@@ -889,7 +942,7 @@ def lambda_handler(event, context):
         except Exception as e:
             logger.error(f"bedrock call failed: {e}")
             return render(inquiry, person_id,
-                          '<div class="dm-result">Matching call failed: '
+                          person_note + '<div class="dm-result">Matching call failed: '
                           + html.escape(str(e)) + "</div>", side)
 
         output, id_fixes, id_flags = check_deal_ids(output, matched_deals)
@@ -907,7 +960,7 @@ def lambda_handler(event, context):
                 '<div class="dm-result" id="dm-output">' + html.escape(output) + "</div>"
                 '<button class="dm-copy" type="button" onclick="dmCopy()">Copy output</button>'
             )
-        result_html = id_warning_html(id_fixes, id_flags) + result_html
+        result_html = person_note + id_warning_html(id_fixes, id_flags) + result_html
         return render(inquiry, person_id, result_html, side)
 
     return respond(405, "Method not allowed")
