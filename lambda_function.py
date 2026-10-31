@@ -61,7 +61,8 @@ PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>Deal Matcher</title>
+<title>Deal List Writer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🖋️</text></svg>">
 <link rel="stylesheet" href="https://s3.us-east-1.amazonaws.com/main.css/master.css">
 <style>
 .dm-wrap { max-width: 760px; margin: 40px auto; padding: 0 20px; }
@@ -75,7 +76,7 @@ PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <div class="dm-wrap">
-<h1>Deal Matcher</h1>
+<h1>Deal List Writer</h1>
 <p>Paste an inbound inquiry. Optionally add the Pipeline person ID for context from notes.</p>
 <form method="POST" action="/?key=__KEY__">
 <label class="dm-label">Inquiry text</label>
