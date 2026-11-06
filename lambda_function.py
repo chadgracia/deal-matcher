@@ -7,6 +7,7 @@ import html
 import urllib.request
 import urllib.parse
 import logging
+import time
 from urllib.parse import parse_qs
 
 import boto3
@@ -195,8 +196,9 @@ def get_live_deals():
             slim["order_side"] = "UNKNOWN SIDE (do not present as available)"
         if "stage" in slim:
             slim["crm_stage"] = slim.pop("stage")
-        # Internal only (own-deal exclusion); stripped before the model call.
+        # Internal only (own-deal exclusion, outlier filter); stripped before the model call.
         slim["_contact_email"] = str(d.get("email") or "").strip().lower()
+        slim["_structure_class"] = str(d.get("structure_class") or "").strip().lower()
         deals.append(slim)
     return deals
 
@@ -284,6 +286,162 @@ def get_holder_interest():
                     results.append({"company": name, "buy_count": buy, "sell_count": sell})
     logger.info(f"holder_interest parsed: {len(results)} companies")
     return results
+
+
+# ── Unconfirmed rule (shared with chadgracia/trades and CRMDealDetails) ──────
+# Threshold = REFRESH days if set (0 = never Unconfirmed); else 30 days for
+# Seller Role "GP — syndicating new allocation", else 60. Unconfirmed when
+# LAST_CONFIRMED is blank or older than the threshold (days from today's UTC
+# date). Hold is never Unconfirmed; a deal missing from deals.json counts as
+# confirmed; any load failure -> every deal confirmed.
+
+LAST_CONFIRMED_FIELD = "custom_label_4012491"   # YYYY/MM/DD (YYYY-MM-DD also accepted)
+REFRESH_FIELD = "custom_label_3994687"          # days; 0 = never Unconfirmed
+SELLER_ROLE_FIELD = "custom_label_3938748"
+SR_NEW_ALLOCATION_ID = 7020357                  # GP — syndicating new allocation
+HOLD_STAGE_ID = 2094373
+_CONFIRM_CACHE = {"ts": 0.0, "map": None}
+_CONFIRM_TTL = 600
+
+
+def _cf_scalar(cf, field):
+    v = (cf or {}).get(field)
+    if isinstance(v, list):
+        v = v[0] if v else None
+    return v
+
+
+def _cf_int(cf, field):
+    v = _cf_scalar(cf, field)
+    if v in (None, ""):
+        return None
+    try:
+        return int(float(str(v)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_confirmed_date(v):
+    """'YYYY/MM/DD' or 'YYYY-MM-DD' -> date, else None."""
+    s = str(v or "").strip()[:10].replace("-", "/")
+    try:
+        return datetime.datetime.strptime(s, "%Y/%m/%d").date()
+    except ValueError:
+        return None
+
+
+def build_confirm_map(raw):
+    """deals.json payload -> {deal_id(str): (stage_id, last_confirmed, refresh, seller_role)}."""
+    out = {}
+    for d in (raw.get("deals") if isinstance(raw, dict) else raw) or []:
+        try:
+            cf = d.get("custom_fields") or {}
+            stage_id = (d.get("deal_stage") or {}).get("id") or d.get("deal_stage_id")
+            out[str(d["id"])] = (
+                int(stage_id) if stage_id not in (None, "") else None,
+                _parse_confirmed_date(_cf_scalar(cf, LAST_CONFIRMED_FIELD)),
+                _cf_int(cf, REFRESH_FIELD),
+                _cf_int(cf, SELLER_ROLE_FIELD),
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return out
+
+
+def load_confirm_map():
+    """Cached per container for 10 minutes. Never raises; {} on failure (all confirmed)."""
+    now = time.time()
+    if _CONFIRM_CACHE["map"] is not None and now - _CONFIRM_CACHE["ts"] < _CONFIRM_TTL:
+        return _CONFIRM_CACHE["map"]
+    try:
+        m = build_confirm_map(load_s3_json("full-pipeline-cache", "deals.json"))
+    except Exception as e:
+        logger.warning(f"unconfirmed: deals.json load failed, treating all deals as confirmed: {e}")
+        return {}
+    _CONFIRM_CACHE["ts"], _CONFIRM_CACHE["map"] = now, m
+    return m
+
+
+def is_unconfirmed(deal_id, confirm_map, today=None):
+    try:
+        rec = confirm_map.get(str(deal_id))
+        if not rec:
+            return False
+        stage_id, last, refresh, seller_role = rec
+        if stage_id == HOLD_STAGE_ID:
+            return False
+        if refresh is not None:
+            if refresh <= 0:
+                return False
+            threshold = refresh
+        else:
+            threshold = 30 if seller_role == SR_NEW_ALLOCATION_ID else 60
+        if last is None:
+            return True
+        today = today or datetime.datetime.now(datetime.timezone.utc).date()
+        return (today - last).days > threshold
+    except Exception as e:
+        logger.warning(f"unconfirmed: check failed for {deal_id}: {e}")
+        return False
+
+
+# ── Price outliers (Direct deals only) ────────────────────────────────────────
+# Per company + side, the reference is the best CONFIRMED Direct gross (lowest
+# sell / highest buy). Drop Direct sells > 1.5x ref and Direct buys < 0.67x ref,
+# confirmed or not. Unpriced, non-Direct and unknown-structure deals are never
+# filtered; the last deal for a company + side is never dropped.
+
+OUTLIER_SELL_MULT = 1.5
+OUTLIER_BUY_MULT = 0.67
+
+
+def _gross_num(deal):
+    try:
+        v = float(str(deal.get("gross")).replace("$", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def filter_price_outliers(deals):
+    """Returns (kept, dropped); dropped = [(company, side, deal_id, gross, reference, unconfirmed)]."""
+    groups = {}
+    for d in deals:
+        side = _deal_side(d)
+        if side and _deal_company(d):
+            groups.setdefault((_deal_company(d).lower(), side), []).append(d)
+    drop_ids = set()
+    dropped = []
+    for (co, side), group in groups.items():
+        direct = [(d, _gross_num(d)) for d in group if d.get("_structure_class") == "direct"]
+        conf = [g for d, g in direct if g is not None and not d.get("unconfirmed")]
+        if not conf:
+            continue
+        ref = min(conf) if side == "sell" else max(conf)
+        out = [(d, g) for d, g in direct if g is not None and
+               (g > OUTLIER_SELL_MULT * ref if side == "sell" else g < OUTLIER_BUY_MULT * ref)]
+        if len(out) >= len(group):
+            out.sort(key=lambda x: abs(x[1] - ref))
+            out = out[1:]
+        for d, g in out:
+            drop_ids.add(id(d))
+            dropped.append((_deal_company(d), side, d.get("id"), g, ref, bool(d.get("unconfirmed"))))
+    return [d for d in deals if id(d) not in drop_ids], dropped
+
+
+def _fmt_px(v):
+    return f"${v:,.0f}" if v == int(v) else f"${v:,.2f}"
+
+
+def outlier_html(dropped):
+    if not dropped:
+        return ""
+    lines = []
+    for co, side, deal_id, gross, ref, _unconf in dropped:
+        lines.append(html.escape(f"{co} — {side} {_fmt_px(gross)} vs best {_fmt_px(ref)} — "
+                                 f"https://app.pipelinecrm.com/deals/{deal_id}"))
+    return ('<div class="dm-outliers" style="color:#6b7280;font-size:13px;line-height:1.5;margin-top:24px;">'
+            "Hidden as price outliers (check or obsolete in Pipeline):<br>" + "<br>".join(lines) + "</div>")
 
 
 # ── Pipeline live pulls (person context) ──────────────────────────────────────
@@ -538,7 +696,12 @@ SYSTEM_PROMPT = (
     "on cap table; inquirer's position is L2'. Likewise, an inquirer who "
     "requires L1/on cap table does not match 2-Layer or 3-Layer sell orders. "
     "If a deal lists no layer information, say the layer is unconfirmed "
-    "rather than calling it compatible.\n\n"
+    "rather than calling it compatible.\n"
+    "- Deals with unconfirmed=true are older indications that may no longer "
+    "be available. In MATCHES, append '(unconfirmed)' to them. In the email, "
+    "describe them as an older indication that Chad will reconfirm. Never "
+    "present them as firmly available. When fit is otherwise equal, list "
+    "confirmed deals first.\n\n"
     "OUTPUT FORMAT (plain text, exactly these two sections):\n"
     "=== MATCHES ===\n"
     "Bullet list: each match with company, live deal or tracked-only, and one "
@@ -964,8 +1127,13 @@ def lambda_handler(event, context):
                 {"company": d.get("company"), "order_side": d.get("order_side"), "id": d.get("id")}
                 for d in own
             ]
+        confirm_map = load_confirm_map()
+        for d in matched_deals:
+            d["unconfirmed"] = is_unconfirmed(d.get("id"), confirm_map)
+        matched_deals, outliers = filter_price_outliers(matched_deals)
         for d in matched_deals:
             d.pop("_contact_email", None)
+            d.pop("_structure_class", None)
         if person_ctx:
             person_ctx.pop("_emails", None)
 
@@ -1011,7 +1179,7 @@ def lambda_handler(event, context):
                 '<div class="dm-result" id="dm-output">' + html.escape(output) + "</div>"
                 '<button class="dm-copy" type="button" onclick="dmCopy()">Copy output</button>'
             )
-        result_html = person_note + id_warning_html(id_fixes, id_flags) + result_html
+        result_html = person_note + id_warning_html(id_fixes, id_flags) + outlier_html(outliers) + result_html
         return render(inquiry, person_id, result_html, side)
 
     return respond(405, "Method not allowed")
