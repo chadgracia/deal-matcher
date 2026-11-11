@@ -7,15 +7,26 @@ AWS Lambda (Python, single file `lambda_function.py`). Deployed to the `deal-mat
 - `python3.12 -m py_compile lambda_function.py`
 - `python3.12 -m unittest discover -s tests` (needs `boto3` importable; no AWS calls)
 
-## Unconfirmed deals (shared rule — keep identical to chadgracia/trades and CRMDealDetails)
-- Source: `s3://full-pipeline-cache/deals.json` (raw Pipeline snapshot, `{"deals": [...]}`), cached per
-  container for 10 minutes (`load_confirm_map`). Fail-soft: any load error -> every deal is confirmed.
+## Unconfirmed rule (shared — MUST stay identical to CRMDealDetails `unconfirmed_status()` and trades `_unconfirmed_since()`)
+- Source: `s3://full-pipeline-cache/deals.json` (raw Pipeline snapshot, `{"deals": [...]}`) plus the
+  stale-deal-scanner log `s3://full-pipeline-cache/obsolete-review/log.json`, both loaded with
+  `load_s3_json` inside the same per-container 10-minute cache (`load_confirm_map`). Fail-soft: any
+  deals.json load error -> every deal is confirmed; a missing/unreadable/malformed log -> no restores
+  (never fails the deals load).
 - Fields: LAST_CONFIRMED `custom_label_4012491` ("YYYY/MM/DD" or "YYYY-MM-DD"), REFRESH
-  `custom_label_3994687` (days), SELLER_ROLE `custom_label_3938748`.
+  `custom_label_3994687` (days), SELLER_ROLE `custom_label_3938748`, and the deal's `updated_at`
+  (Pipeline "YYYY/MM/DD HH:MM:SS +0000" or ISO -> aware UTC datetime; missing/unparseable = ignored).
 - Threshold = REFRESH if set (0 = never Unconfirmed); else 30 days if SELLER_ROLE is 7020357
   (GP — syndicating new allocation), else 60.
-- Unconfirmed when LAST_CONFIRMED is blank or more than the threshold days before today's UTC date.
-  Hold (stage 2094373) is never Unconfirmed. A deal missing from deals.json counts as confirmed.
+- Effective date = the newer of LAST_CONFIRMED and the UTC date of `updated_at` (any Pipeline edit
+  counts as confirmation). Unconfirmed when there is no effective date, or it is more than the
+  threshold days before today's UTC date. Hold (stage 2094373) is never Unconfirmed. A deal missing
+  from deals.json counts as confirmed.
+- Restore exception: per deal take the LATEST log entry (newest `at`; tie/unreadable -> later in the
+  list). If its action is `"restored"`, `updated_at` counts only when > 15 minutes after that `at`
+  (unreadable `at` -> ignore `updated_at`); otherwise LAST_CONFIRMED alone. Stops a bulk restore's own
+  write from making an old deal look confirmed; later edits still count.
+- Tests: `tests/test_unconfirmed_outliers.py`, `tests/test_unconfirmed_updated_at.py`.
 - The model gets `"unconfirmed": true/false` on each live deal — never the date. SYSTEM_PROMPT tells it
   to tag them "(unconfirmed)" in MATCHES, call them older indications Chad will reconfirm in the email,
   and list confirmed deals first when fit is equal.

@@ -289,11 +289,19 @@ def get_holder_interest():
 
 
 # ── Unconfirmed rule (shared with chadgracia/trades and CRMDealDetails) ──────
-# Threshold = REFRESH days if set (0 = never Unconfirmed); else 30 days for
-# Seller Role "GP — syndicating new allocation", else 60. Unconfirmed when
-# LAST_CONFIRMED is blank or older than the threshold (days from today's UTC
+# MUST stay identical to CRMDealDetails unconfirmed_status() and trades
+# _unconfirmed_since(). Threshold = REFRESH days if set (0 = never
+# Unconfirmed); else 30 days for Seller Role "GP — syndicating new allocation",
+# else 60. Effective date = the newer of LAST_CONFIRMED and the UTC date of the
+# deal's updated_at (any Pipeline edit counts as confirmation; a missing or
+# unparseable updated_at is ignored). Restore exception: if the deal's latest
+# stale-deal-scanner entry in full-pipeline-cache/obsolete-review/log.json is
+# "restored", updated_at counts only when it is more than 15 minutes after that
+# entry's "at" (unreadable "at" -> ignore updated_at). Unconfirmed when there is
+# no effective date or it is older than the threshold (days from today's UTC
 # date). Hold is never Unconfirmed; a deal missing from deals.json counts as
-# confirmed; any load failure -> every deal confirmed.
+# confirmed; any deals.json load failure -> every deal confirmed; a missing or
+# bad restore log -> no restores.
 
 LAST_CONFIRMED_FIELD = "custom_label_4012491"   # YYYY/MM/DD (YYYY-MM-DD also accepted)
 REFRESH_FIELD = "custom_label_3994687"          # days; 0 = never Unconfirmed
@@ -302,6 +310,8 @@ SR_NEW_ALLOCATION_ID = 7020357                  # GP — syndicating new allocat
 HOLD_STAGE_ID = 2094373
 _CONFIRM_CACHE = {"ts": 0.0, "map": None}
 _CONFIRM_TTL = 600
+RESTORE_LOG_KEY = "obsolete-review/log.json"    # written by stale-deal-scanner
+RESTORE_GRACE_MINUTES = 15
 
 
 def _cf_scalar(cf, field):
@@ -330,8 +340,53 @@ def _parse_confirmed_date(v):
         return None
 
 
-def build_confirm_map(raw):
-    """deals.json payload -> {deal_id(str): (stage_id, last_confirmed, refresh, seller_role)}."""
+def _parse_iso_utc(v):
+    """ISO timestamp -> aware UTC datetime (naive treated as UTC), else None."""
+    try:
+        dt = datetime.datetime.fromisoformat(str(v).strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_updated_at(v):
+    """Pipeline updated_at ('YYYY/MM/DD HH:MM:SS +0000', also ISO) -> aware UTC datetime, else None."""
+    s = str(v or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.datetime.strptime(s, "%Y/%m/%d %H:%M:%S %z").astimezone(datetime.timezone.utc)
+    except ValueError:
+        return _parse_iso_utc(s)
+
+
+def build_restore_map(raw):
+    """obsolete-review log payload -> {deal_id(str): latest entry}. Latest = newest
+    "at"; on a tie or unreadable time, the one later in the list. Never raises;
+    malformed -> {} (no restores)."""
+    by_deal, best = {}, {}
+    try:
+        entries = raw.get("entries") or []
+        floor = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        for i, e in enumerate(entries):
+            if not isinstance(e, dict) or e.get("deal_id") is None:
+                continue
+            did = str(e.get("deal_id")).strip()
+            key = (_parse_iso_utc(e.get("at")) or floor, i)
+            if did not in best or key >= best[did]:
+                best[did], by_deal[did] = key, e
+    except Exception as e:
+        logger.warning(f"unconfirmed: restore log malformed, ignoring: {e!r}")
+        return {}
+    return by_deal
+
+
+def build_confirm_map(raw, restores=None):
+    """deals.json payload (+ restore map) -> {deal_id(str): (stage_id, last_confirmed,
+    refresh, seller_role, updated_at, restore_entry)}."""
+    restores = restores or {}
     out = {}
     for d in (raw.get("deals") if isinstance(raw, dict) else raw) or []:
         try:
@@ -342,6 +397,8 @@ def build_confirm_map(raw):
                 _parse_confirmed_date(_cf_scalar(cf, LAST_CONFIRMED_FIELD)),
                 _cf_int(cf, REFRESH_FIELD),
                 _cf_int(cf, SELLER_ROLE_FIELD),
+                _parse_updated_at(d.get("updated_at")),
+                restores.get(str(d["id"])),
             )
         except (KeyError, TypeError, ValueError, AttributeError):
             continue
@@ -354,7 +411,17 @@ def load_confirm_map():
     if _CONFIRM_CACHE["map"] is not None and now - _CONFIRM_CACHE["ts"] < _CONFIRM_TTL:
         return _CONFIRM_CACHE["map"]
     try:
-        m = build_confirm_map(load_s3_json("full-pipeline-cache", "deals.json"))
+        raw = load_s3_json("full-pipeline-cache", "deals.json")
+    except Exception as e:
+        logger.warning(f"unconfirmed: deals.json load failed, treating all deals as confirmed: {e}")
+        return {}
+    try:
+        restores = build_restore_map(load_s3_json("full-pipeline-cache", RESTORE_LOG_KEY))
+    except Exception as e:
+        logger.warning(f"unconfirmed: restore log unavailable, assuming no restores: {e!r}")
+        restores = {}
+    try:
+        m = build_confirm_map(raw, restores)
     except Exception as e:
         logger.warning(f"unconfirmed: deals.json load failed, treating all deals as confirmed: {e}")
         return {}
@@ -367,7 +434,7 @@ def is_unconfirmed(deal_id, confirm_map, today=None):
         rec = confirm_map.get(str(deal_id))
         if not rec:
             return False
-        stage_id, last, refresh, seller_role = rec
+        stage_id, last, refresh, seller_role, updated, restore = rec
         if stage_id == HOLD_STAGE_ID:
             return False
         if refresh is not None:
@@ -376,10 +443,15 @@ def is_unconfirmed(deal_id, confirm_map, today=None):
             threshold = refresh
         else:
             threshold = 30 if seller_role == SR_NEW_ALLOCATION_ID else 60
-        if last is None:
+        if updated is not None and isinstance(restore, dict) and restore.get("action") == "restored":
+            at = _parse_iso_utc(restore.get("at"))
+            if at is None or updated <= at + datetime.timedelta(minutes=RESTORE_GRACE_MINUTES):
+                updated = None   # the restore's own write is not a confirmation
+        dates = [d for d in (last, updated.date() if updated else None) if d is not None]
+        if not dates:
             return True
         today = today or datetime.datetime.now(datetime.timezone.utc).date()
-        return (today - last).days > threshold
+        return (today - max(dates)).days > threshold
     except Exception as e:
         logger.warning(f"unconfirmed: check failed for {deal_id}: {e}")
         return False
