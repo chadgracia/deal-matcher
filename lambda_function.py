@@ -308,7 +308,7 @@ REFRESH_FIELD = "custom_label_3994687"          # days; 0 = never Unconfirmed
 SELLER_ROLE_FIELD = "custom_label_3938748"
 SR_NEW_ALLOCATION_ID = 7020357                  # GP — syndicating new allocation
 HOLD_STAGE_ID = 2094373
-_CONFIRM_CACHE = {"ts": 0.0, "map": None}
+_CONFIRM_CACHE = {"ts": 0.0, "map": None, "vis": None}
 _CONFIRM_TTL = 600
 RESTORE_LOG_KEY = "obsolete-review/log.json"    # written by stale-deal-scanner
 RESTORE_GRACE_MINUTES = 15
@@ -425,7 +425,12 @@ def load_confirm_map():
     except Exception as e:
         logger.warning(f"unconfirmed: deals.json load failed, treating all deals as confirmed: {e}")
         return {}
-    _CONFIRM_CACHE["ts"], _CONFIRM_CACHE["map"] = now, m
+    try:
+        vis = build_visibility_map(raw)
+    except Exception as e:
+        logger.warning(f"visibility: deals.json parse failed: {type(e).__name__}")
+        vis = None
+    _CONFIRM_CACHE["ts"], _CONFIRM_CACHE["map"], _CONFIRM_CACHE["vis"] = now, m, vis
     return m
 
 
@@ -455,6 +460,108 @@ def is_unconfirmed(deal_id, confirm_map, today=None):
     except Exception as e:
         logger.warning(f"unconfirmed: check failed for {deal_id}: {e}")
         return False
+
+
+# ── Visibility (shared rule — see CLAUDE.md) ─────────────────────────────────
+# Base map from deals.json (same load/10-min cache as load_confirm_map), then
+# visibility-overrides.json (written by deal-update-form, cached 60 s) on top.
+# Blank/unknown = VIS_ALL. Private deals never reach the model or the email;
+# Interested-only deals are flagged for the model and listed on the results page.
+
+VISIBILITY_FIELD = "custom_label_4013323"
+VIS_ALL = 7223456          # "All Investors"
+VIS_INTERESTED = 7223457   # "Interested investors only"
+VIS_PRIVATE = 7223458      # "Private"
+_VIS_KNOWN = (VIS_ALL, VIS_INTERESTED, VIS_PRIVATE)
+VIS_OVERRIDES_KEY = "visibility-overrides.json"
+_VIS_OVERRIDES_CACHE = {"ts": 0.0, "data": None}
+_VIS_OVERRIDES_TTL = 60
+
+
+def vis_value(v):
+    """Pipeline dropdown value (int, numeric str, '7223458.0', 1-element list) -> option id; else VIS_ALL."""
+    try:
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else None
+        if v is None or isinstance(v, bool):
+            return VIS_ALL
+        n = int(float(str(v).strip()))
+        return n if n in _VIS_KNOWN else VIS_ALL
+    except (TypeError, ValueError, OverflowError):
+        return VIS_ALL
+
+
+def build_visibility_map(raw):
+    """deals.json payload -> {deal_id(str): option id}."""
+    out = {}
+    for d in (raw.get("deals") if isinstance(raw, dict) else raw) or []:
+        if isinstance(d, dict) and d.get("id") is not None:
+            out[str(d["id"])] = vis_value((d.get("custom_fields") or {}).get(VISIBILITY_FIELD))
+    return out
+
+
+def load_visibility_overrides():
+    """{deal_id(str): option id} from visibility-overrides.json, cached 60 s. Missing file = {}."""
+    now = time.time()
+    if _VIS_OVERRIDES_CACHE["data"] is not None and now - _VIS_OVERRIDES_CACHE["ts"] < _VIS_OVERRIDES_TTL:
+        return _VIS_OVERRIDES_CACHE["data"]
+    try:
+        raw = load_s3_json("full-pipeline-cache", VIS_OVERRIDES_KEY)
+    except Exception as e:
+        if getattr(e, "response", {}).get("Error", {}).get("Code") not in ("NoSuchKey", "404"):
+            raise
+        raw = {}
+    data = {}
+    for k, v in (raw.items() if isinstance(raw, dict) else []):
+        data[str(k).strip()] = vis_value(v.get("v") if isinstance(v, dict) else None)
+    _VIS_OVERRIDES_CACHE["ts"], _VIS_OVERRIDES_CACHE["data"] = now, data
+    return data
+
+
+def load_visibility_map():
+    """Base map from the cached deals.json load + overrides on top. Never raises;
+    None on failure (= no visibility filtering, current behaviour)."""
+    try:
+        load_confirm_map()
+        base = _CONFIRM_CACHE.get("vis")
+        if base is None or time.time() - _CONFIRM_CACHE["ts"] >= _CONFIRM_TTL:
+            raise RuntimeError("deals.json unavailable")
+        m = dict(base)
+        try:
+            m.update(load_visibility_overrides())
+        except Exception as e:
+            logger.warning(f"visibility: overrides unreadable, using deals.json only: {type(e).__name__}")
+        return m
+    except Exception as e:
+        logger.warning(f"visibility: lookup failed; no visibility filtering: {type(e).__name__}")
+        return None
+
+
+def apply_visibility(deals, vis_map):
+    """Drops VIS_PRIVATE deals; flags VIS_INTERESTED ones with interested_investors_only=True.
+    Returns (kept, interested). vis_map None/empty -> deals unchanged."""
+    if not vis_map:
+        return deals, []
+    kept, interested = [], []
+    for d in deals:
+        v = vis_map.get(str(d.get("id")), VIS_ALL)
+        if v == VIS_PRIVATE:
+            continue
+        if v == VIS_INTERESTED:
+            d["interested_investors_only"] = True
+            interested.append(d)
+        kept.append(d)
+    return kept, interested
+
+
+def interested_html(deals):
+    if not deals:
+        return ""
+    lines = [html.escape(f"{_deal_company(d)} — {d.get('order_side', '').split(' (')[0].title()} — "
+                         f"https://app.pipelinecrm.com/deals/{d.get('id')}") for d in deals]
+    return ('<div class="dm-interested" style="color:#6b7280;font-size:13px;line-height:1.5;margin-top:24px;">'
+            "Interested investors only (included above; your call whether to offer):<br>"
+            + "<br>".join(lines) + "</div>")
 
 
 # ── Price outliers (Direct deals only) ────────────────────────────────────────
@@ -773,7 +880,11 @@ SYSTEM_PROMPT = (
     "be available. In MATCHES, append '(unconfirmed)' to them. In the email, "
     "describe them as an older indication that Chad will reconfirm. Never "
     "present them as firmly available. When fit is otherwise equal, list "
-    "confirmed deals first.\n\n"
+    "confirmed deals first.\n"
+    "- Deals with interested_investors_only=true are restricted listings "
+    "for Chad's judgement. In MATCHES, append '(interested investors only)' "
+    "to them. In the email, never mention that phrase, the restriction, or "
+    "any visibility setting; describe them like any other deal.\n\n"
     "OUTPUT FORMAT (plain text, exactly these two sections):\n"
     "=== MATCHES ===\n"
     "Bullet list: each match with company, live deal or tracked-only, and one "
@@ -1199,6 +1310,7 @@ def lambda_handler(event, context):
                 {"company": d.get("company"), "order_side": d.get("order_side"), "id": d.get("id")}
                 for d in own
             ]
+        matched_deals, _ = apply_visibility(matched_deals, load_visibility_map())
         confirm_map = load_confirm_map()
         for d in matched_deals:
             d["unconfirmed"] = is_unconfirmed(d.get("id"), confirm_map)
@@ -1251,7 +1363,9 @@ def lambda_handler(event, context):
                 '<div class="dm-result" id="dm-output">' + html.escape(output) + "</div>"
                 '<button class="dm-copy" type="button" onclick="dmCopy()">Copy output</button>'
             )
-        result_html = person_note + id_warning_html(id_fixes, id_flags) + outlier_html(outliers) + result_html
+        interested = [d for d in matched_deals if d.get("interested_investors_only")]
+        result_html = (person_note + id_warning_html(id_fixes, id_flags) + outlier_html(outliers)
+                       + interested_html(interested) + result_html)
         return render(inquiry, person_id, result_html, side)
 
     return respond(405, "Method not allowed")

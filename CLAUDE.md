@@ -43,6 +43,21 @@ AWS Lambda (Python, single file `lambda_function.py`). Deployed to the `deal-mat
 - Dropped deals appear ONLY on the results page, in the muted "Hidden as price outliers (check or
   obsolete in Pipeline):" block (`outlier_html`). Never sent to the model, never in the email draft.
 
+## Visibility (shared spec — `custom_label_4013323`)
+- Options: VIS_ALL 7223456, VIS_INTERESTED 7223457, VIS_PRIVATE 7223458. Blank/unknown/unparseable = VIS_ALL
+  (`vis_value` normalises int, numeric str, "7223458.0", 1-element list).
+- Map (`load_visibility_map`): base from the deals.json payload inside `load_confirm_map`'s 10-min cache
+  (`_CONFIRM_CACHE["vis"]`, no second fetch), then `s3://full-pipeline-cache/visibility-overrides.json`
+  (`{"<deal_id>": {"v", "at"}}`, written by deal-update-form, cached 60 s, NoSuchKey = {}) on top; override wins.
+  Overrides unreadable -> deals.json only. deals.json unavailable -> one `visibility: lookup failed; no
+  visibility filtering` log line and current behaviour.
+- `apply_visibility` runs on `matched_deals` right after own-deal exclusion, before unconfirmed flags and
+  outlier filtering: VIS_PRIVATE dropped (never reaches the model, email draft, outliers or the results page);
+  VIS_INTERESTED kept with `interested_investors_only: true` (key only set when true).
+- Admin output only: SYSTEM_PROMPT tags them "(interested investors only)" in MATCHES and forbids mentioning
+  the phrase or restriction in the email; the results page lists them in the muted `interested_html` block.
+- Tests: `tests/test_visibility.py`.
+
 ## SECURITY RULES — MANDATORY (read before any change)
 
 This repo is PUBLIC, and so are its GitHub Actions logs. Secrets have leaked from Chad's repos 5-6 times. Never again.
